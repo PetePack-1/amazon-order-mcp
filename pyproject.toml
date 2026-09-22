@@ -5,7 +5,7 @@ description = "MCP server wrapper for amazon-orders library"
 requires-python = ">=3.10"
 dependencies = [
     "mcp[cli]>=1.2.0",
-    "amazon-orders>=4.0.0",
+    "amazon-orders[browser]>=4.0.0",
     "python-dotenv>=1.0.0",
     "nest-asyncio>=1.6.0",
 ]

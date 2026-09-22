@@ -3,17 +3,26 @@
 
 import os
 import json
+import re
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Any
+from urllib.parse import urlencode, urlparse
 
 # Fix asyncio nested event loop issue
 import nest_asyncio
 nest_asyncio.apply()
 
 from mcp.server.fastmcp import FastMCP
+from dateutil import parser as date_parser
 from dotenv import load_dotenv
 
+from amazonorders.conf import AmazonOrdersConfig
+from amazonorders import util
+from amazonorders.constants import Constants
+from amazonorders.entity.item import Item
+from amazonorders.entity.order import Order
 from amazonorders.session import AmazonSession, IODefault
 from amazonorders.orders import AmazonOrders
 
@@ -22,6 +31,159 @@ load_dotenv()
 
 # Initialize MCP server
 mcp = FastMCP(name="amazon-orders")
+
+# Playwright-based solvers for Amazon's JavaScript login challenges (requires the [browser] extra)
+BROWSER_AUTH_FORMS = [
+    "amazonorders.contrib.browser.playwright.PlaywrightAcicForm",
+    "amazonorders.contrib.browser.playwright.PlaywrightJSAuthForm",
+    "amazonorders.contrib.browser.playwright.PlaywrightManualWafForm",
+]
+
+# Store-specific sign-in handle and auth cookie; amazon-orders only sets these for amazon.com
+REGION_AUTH = {
+    "de": ("deflex", "x-acbde"),
+    "co.uk": ("gbflex", "x-acbuk"),
+    "fr": ("frflex", "x-acbfr"),
+    "it": ("itflex", "x-acbit"),
+    "es": ("esflex", "x-acbes"),
+}
+
+
+class RegionalConstants(Constants):
+    """Constants that also adjust sign-in parameters for non-US Amazon stores."""
+
+    def __init__(self, config: Optional[AmazonOrdersConfig] = None) -> None:
+        super().__init__(config)
+        # The class default is read at import time, before load_dotenv() runs
+        if os.environ.get("AMAZON_CURRENCY_SYMBOL"):
+            self.CURRENCY_SYMBOL = os.environ["AMAZON_CURRENCY_SYMBOL"]
+
+    def _apply_domain(self, domain: str) -> None:
+        super()._apply_domain(domain)
+
+        host = urlparse(self.BASE_URL).netloc.lower().removeprefix("www.")
+        region = REGION_AUTH.get(host.removeprefix("amazon."))
+        if region is None:
+            return
+
+        assoc_handle, auth_cookie = region
+        self.SIGN_IN_QUERY_PARAMS = {**self.SIGN_IN_QUERY_PARAMS, "openid.assoc_handle": assoc_handle}
+        self.BASE_HEADERS = {**self.BASE_HEADERS,
+                             "Referer": f"{self.SIGN_IN_URL}?{urlencode(self.SIGN_IN_QUERY_PARAMS)}"}
+        self.COOKIES_SET_WHEN_AUTHENTICATED = [auth_cookie]
+
+
+class GermanDateInfo(date_parser.parserinfo):
+    """dateutil month names as they appear on amazon.de ("17. September 2026", "3. März 2025")."""
+
+    MONTHS = [("Jan", "Januar"), ("Feb", "Februar"), ("Mär", "März", "Mrz"), ("Apr", "April"), ("Mai",),
+              ("Jun", "Juni"), ("Jul", "Juli"), ("Aug", "August"), ("Sep", "Sept", "September"),
+              ("Okt", "Oktober"), ("Nov", "November"), ("Dez", "Dezember")]
+
+
+def parse_german_date(value: str):
+    try:
+        return date_parser.parse(value, fuzzy=True, parserinfo=GermanDateInfo(dayfirst=True)).date()
+    except (ValueError, OverflowError):
+        return None
+
+
+# amazon-orders looks up order totals by English label; these are the exact amazon.de labels
+GERMAN_CURRENCY_LABELS = {
+    "grand total": ["gesamtsumme", "summe"],
+    "subtotal": ["zwischensumme"],
+    "shipping": ["verpackung & versand"],
+    "before tax": ["gesamt vor ust."],
+    "estimated tax": ["geschätzte ust."],
+}
+
+
+class GermanParsingMixin:
+    """Parse amazon.de's German dates and comma-decimal amounts ("1.234,56 €")."""
+
+    def to_currency(self, value):
+        if not isinstance(value, str):
+            return super().to_currency(value)
+
+        value = value.strip()
+        if value.lower() in ("kostenlos", "gratis"):
+            return 0.0
+
+        negative = value.startswith("-") or (value.startswith("(") and value.endswith(")"))
+        number = re.sub(r"[^\d,]", "", value).replace(",", ".")
+        if not number:
+            return None
+        try:
+            amount = float(number)
+        except ValueError:
+            return None
+        return -amount if negative else amount
+
+    def simple_parse(self, selector, *args, parse_date=False, **kwargs):
+        value = super().simple_parse(selector, *args, **kwargs)
+        if parse_date and isinstance(value, str):
+            value = parse_german_date(value)
+        return value
+
+
+class GermanItem(GermanParsingMixin, Item):
+    pass
+
+
+class GermanOrder(GermanParsingMixin, Order):
+    def _parse_currency(self, contains, combine_multiple=False):
+        labels = GERMAN_CURRENCY_LABELS.get(contains)
+        if labels is None:
+            return None
+
+        selectors = self.config.selectors
+        for label in labels:
+            value = None
+            for tag in util.select(self.parsed, selectors.FIELD_ORDER_SUBTOTALS_TAG_ITERATOR_SELECTOR):
+                if (tag.get_text(" ", strip=True).split(":")[0].strip().lower() != label or
+                        util.select_one(tag, selectors.FIELD_ORDER_SUBTOTALS_TAG_POPOVER_PRELOAD_SELECTOR)):
+                    continue
+                inner_tag = util.select_one(tag, selectors.FIELD_ORDER_SUBTOTALS_INNER_TAG_SELECTOR)
+                currency = self.to_currency(inner_tag.text) if inner_tag else None
+                if currency is not None:
+                    value = (value or 0.0) + currency
+                    if not combine_multiple:
+                        break
+            if value is not None:
+                return value
+
+        # Order history cards (e.g. digital orders) only show the total in the header
+        if contains == "grand total":
+            return self.to_currency(self._header_value("summe"))
+
+        return None
+
+    def simple_parse(self, selector, *args, parse_date=False, **kwargs):
+        value = super().simple_parse(selector, *args, parse_date=parse_date, **kwargs)
+        # amazon.de order history cards use a header column layout the placed-date selectors don't match
+        if value is None and selector == self.config.selectors.FIELD_ORDER_PLACED_DATE_SELECTOR:
+            header_date = (self._header_value("bestellung aufgegeben") or
+                           self._header_value("abonnement abgerechnet am"))
+            if header_date:
+                value = parse_german_date(header_date)
+        return value
+
+    def _header_value(self, label):
+        for item in self.parsed.select(".order-header__header-list-item"):
+            spans = item.select("span")
+            if len(spans) >= 2 and spans[0].get_text(strip=True).lower() == label:
+                return spans[-1].get_text(strip=True)
+        return None
+
+
+def make_config() -> AmazonOrdersConfig:
+    config = AmazonOrdersConfig(data={"auth_forms_classes": BROWSER_AUTH_FORMS})
+    config.constants = RegionalConstants(config)
+    if urlparse(config.constants.BASE_URL).netloc.lower().removeprefix("www.") == "amazon.de":
+        config.order_cls = GermanOrder
+        config.item_cls = GermanItem
+    return config
+
 
 # Global session cache
 _session: Optional[AmazonSession] = None
@@ -80,10 +242,14 @@ def get_orders_client(otp_code: Optional[str] = None, debug: bool = False) -> Am
         otp_secret_key=otp_secret,
         io=io_handler,
         debug=debug,
+        config=make_config(),
     )
 
     try:
-        _session.login()
+        # Login may launch Playwright's sync API, which refuses to run inside the
+        # MCP server's asyncio loop, so run it in a worker thread without a loop.
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            executor.submit(_session.login).result()
         _pending_otp_request = False
     except OTPRequiredError:
         _pending_otp_request = True

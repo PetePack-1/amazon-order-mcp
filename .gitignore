@@ -1,5 +1,9 @@
 # Environment
 .env
+.venv/
+
+# amazon-orders debug output (contains order pages)
+output/
 
 # Python
 __pycache__/

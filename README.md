@@ -13,7 +13,13 @@ pip install -e .
 Or install dependencies directly:
 
 ```bash
-pip install "mcp[cli]>=1.2.0" "amazon-orders>=4.0.0" "python-dotenv>=1.0.0" "nest-asyncio>=1.6.0"
+pip install "mcp[cli]>=1.2.0" "amazon-orders[browser]>=4.0.0" "python-dotenv>=1.0.0" "nest-asyncio>=1.6.0"
+```
+
+Then install the Chromium browser used to solve Amazon's JavaScript login challenge:
+
+```bash
+playwright install chromium
 ```
 
 ## Configuration
@@ -26,6 +32,13 @@ export AMAZON_PASSWORD="your-amazon-password"
 ```
 
 Or create a `.env` file in the project directory.
+
+For a non-US Amazon store, also set the store URL and currency symbol (other stores than amazon.com are not officially supported by the upstream library):
+
+```bash
+export AMAZON_BASE_URL="https://www.amazon.de"
+export AMAZON_CURRENCY_SYMBOL="€"
+```
 
 ## Claude Code / Claude Desktop Configuration
 
