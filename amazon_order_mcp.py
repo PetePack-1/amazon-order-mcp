@@ -185,6 +185,12 @@ def make_config() -> AmazonOrdersConfig:
     return config
 
 
+def run_outside_event_loop(func, *args):
+    """Run func in a worker thread; Playwright's sync API refuses to run inside the MCP server's asyncio loop."""
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        return executor.submit(func, *args).result()
+
+
 # Global session cache
 _session: Optional[AmazonSession] = None
 _orders_client: Optional[AmazonOrders] = None
@@ -246,10 +252,7 @@ def get_orders_client(otp_code: Optional[str] = None, debug: bool = False) -> Am
     )
 
     try:
-        # Login may launch Playwright's sync API, which refuses to run inside the
-        # MCP server's asyncio loop, so run it in a worker thread without a loop.
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            executor.submit(_session.login).result()
+        run_outside_event_loop(_session.login)
         _pending_otp_request = False
     except OTPRequiredError:
         _pending_otp_request = True
@@ -482,6 +485,139 @@ def amazon_search_orders(
     result = [order_to_dict(order) for order in matching_orders]
 
     return json.dumps(result, indent=2)
+
+
+DEFAULT_INVOICE_DIR = Path.home() / "Downloads" / "amazon-rechnungen"
+UMLAUTS = str.maketrans({"ä": "ae", "ö": "oe", "ü": "ue", "ß": "ss", "Ä": "Ae", "Ö": "Oe", "Ü": "Ue"})
+
+
+def _slug(text: str, max_words: Optional[int] = None) -> str:
+    words = re.findall(r"[a-z0-9]+", text.translate(UMLAUTS).lower())
+    return "-".join(words[:max_words])
+
+
+def _title_slug(order) -> str:
+    """Short hint of what was ordered, from the first item's title (e.g. "bosch-accessories-professional")."""
+    title = next((item.title for item in (order.items or []) if item.title), "")
+    return _slug(title, max_words=3) or "bestellung"
+
+
+def _invoice_links(session: AmazonSession, order_id: str) -> list[tuple[str, str]]:
+    """(document type, absolute URL) of the PDFs in the order's "Rechnung" popover, e.g. ("gutschrift", ...)."""
+    base_url = session.config.constants.BASE_URL
+    popover = session.get(f"{base_url}/your-orders/invoice/popover?orderId={order_id}")
+    links = []
+    for a in popover.parsed.select("a[href*='/documents/download/']"):
+        url = a["href"] if a["href"].startswith("http") else f"{base_url}{a['href']}"
+        if url not in (link_url for _, link_url in links):
+            links.append((_slug(a.get_text(" ")) or "rechnung", url))
+    return links
+
+
+def _download_pdf(session: AmazonSession, url: str, path: Path) -> None:
+    response = session.session.get(url, headers=session.config.constants.BASE_HEADERS, timeout=60)
+    response.raise_for_status()
+    if not response.content.startswith(b"%PDF"):
+        raise ValueError(f"{url} returned {response.headers.get('content-type')} instead of a PDF")
+    path.write_bytes(response.content)
+
+
+def _render_summary_pdf(html: str, base_url: str, path: Path) -> None:
+    """Print Amazon's printable order summary to PDF with the headless Chromium from the [browser] extra."""
+    from playwright.sync_api import sync_playwright
+
+    html = re.sub(r"<head(\s[^>]*)?>", rf'<head\1><base href="{base_url}/">', html, count=1, flags=re.IGNORECASE)
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        try:
+            page = browser.new_page()
+            page.set_content(html, wait_until="networkidle")
+            page.pdf(path=str(path), format="A4", print_background=True)
+        finally:
+            browser.close()
+
+
+def _save_invoices(session: AmazonSession, order, output_dir: Path) -> dict:
+    date = order.order_placed_date.isoformat() if order.order_placed_date else "unbekannt"
+    stem = f"{date}_{order.order_number}_{_title_slug(order)}"
+    result = {"order_number": order.order_number, "saved": [], "existing": []}
+
+    links = _invoice_links(session, order.order_number)
+    if links:
+        used_names = set()
+        for index, (doc_type, url) in enumerate(links, start=1):
+            name = doc_type if doc_type not in used_names else f"{doc_type}-{index}"
+            used_names.add(name)
+            path = output_dir / f"{stem}_{name}.pdf"
+            if path.exists():
+                result["existing"].append(str(path))
+                continue
+            _download_pdf(session, url, path)
+            result["saved"].append(str(path))
+        return result
+
+    # No invoice PDF (e.g. digital orders): save the printable order summary instead
+    path = output_dir / f"{stem}_bestelluebersicht.pdf"
+    if path.exists():
+        result["existing"].append(str(path))
+        return result
+    constants = session.config.constants
+    summary = session.get(f"{constants.ORDER_INVOICE_URL}?orderID={order.order_number}")
+    run_outside_event_loop(_render_summary_pdf, summary.response.text, constants.BASE_URL, path)
+    result["saved"].append(str(path))
+    result["note"] = "Keine Rechnung als PDF verfügbar, druckbare Bestellübersicht gespeichert."
+    return result
+
+
+@mcp.tool()
+def amazon_download_invoices(
+    order_id: Optional[str] = None,
+    year: Optional[int] = None,
+    time_filter: Optional[str] = None,
+    output_dir: Optional[str] = None
+) -> str:
+    """
+    Download invoice PDFs for Amazon orders. Requires amazon_login to be called first.
+
+    Orders without an invoice PDF (e.g. digital orders) get their printable order summary saved as PDF.
+    Files are named <date>_<order number>_<item hint>_<document type>.pdf, where the document type is e.g.
+    rechnung, gutschrift or bestelluebersicht; existing files are skipped.
+
+    Args:
+        order_id: A single Amazon order number. If omitted, all orders of year/time_filter are processed.
+        year: Year to download invoices for (e.g., 2026). Defaults to current year.
+        time_filter: Alternative to year - use "last30" for past 30 days or "months-3" for past 3 months.
+        output_dir: Directory to save the PDFs in. Defaults to ~/Downloads/amazon-rechnungen.
+
+    Returns:
+        JSON string listing saved, already existing and failed files per order.
+    """
+    try:
+        client = get_orders_client()
+    except Exception as e:
+        return _handle_auth_error(e)
+
+    if order_id:
+        orders = [client.get_order(order_id)]
+    else:
+        kwargs = {}
+        if time_filter:
+            kwargs["time_filter"] = time_filter
+        else:
+            kwargs["year"] = year or datetime.now().year
+        orders = client.get_order_history(**kwargs)
+
+    target = Path(output_dir).expanduser() if output_dir else DEFAULT_INVOICE_DIR
+    target.mkdir(parents=True, exist_ok=True)
+
+    results = []
+    for order in orders:
+        try:
+            results.append(_save_invoices(_session, order, target))
+        except Exception as e:
+            results.append({"order_number": order.order_number, "error": str(e)})
+
+    return json.dumps({"output_dir": str(target), "orders": results}, indent=2, ensure_ascii=False)
 
 
 def main():

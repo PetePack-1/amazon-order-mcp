@@ -100,6 +100,16 @@ Search orders by item title.
 - `year` (optional): Year to search in.
 - `time_filter` (optional): Time filter instead of year.
 
+### `amazon_download_invoices`
+
+Download invoice PDFs (including credit notes) for one order or all orders in a period. Orders without an invoice PDF, such as digital orders, get their printable order summary saved as PDF instead. Files are named `<date>_<order number>_<item hint>_<document type>.pdf`, e.g. `2026-01-15_123-4567890-1234567_usb-c-ladekabel_rechnung.pdf`; existing files are skipped.
+
+**Parameters:**
+- `order_id` (optional): A single order number. If omitted, all orders of `year`/`time_filter` are processed.
+- `year` (optional): Year to download invoices for. Defaults to current year.
+- `time_filter` (optional): Time filter instead of year.
+- `output_dir` (optional): Target directory. Defaults to `~/Downloads/amazon-rechnungen`.
+
 ## Important Notes
 
 - **No official API**: This library scrapes Amazon's website and may break if Amazon changes their site structure.
